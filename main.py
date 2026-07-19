@@ -13,7 +13,7 @@ CORS(app, origins="*", supports_credentials=True)
 
 # ---------- CONFIG ----------
 BASE_URL = os.environ.get("PANEL_BASE_URL", "http://smshadi.net")
-USERNAME = os.environ.get("PANEL_USER", "Hassnain756")
+USERNAME = os.environ.get("PANEL_USER", "Hassn756")
 PASSWORD = os.environ.get("PANEL_PASS", "Hassnain756")
 
 HEADERS = {
