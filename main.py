@@ -2,7 +2,7 @@ import os
 import re
 import time
 import requests
-from flask import Flask, jsonify, request
+from flask import Flask, jsonify
 from flask_cors import CORS
 from threading import Lock
 from requests.adapters import HTTPAdapter
@@ -25,25 +25,17 @@ HEADERS = {
 }
 
 # ---------- STATE ----------
-session = None
+session = None          # requests.Session() object with cookie jar
+sesskey = None
 last_login = 0
 login_lock = Lock()
 otp_cache = {"data": [], "timestamp": 0}
 cache_lock = Lock()
 
+# Circuit breaker
 consecutive_failures = 0
 FAILURE_THRESHOLD = 5
 BREAKER_TIMEOUT = 30
-
-# ---------- LOGGING ----------
-log_messages = []
-MAX_LOGS = 100
-
-def add_log(message):
-    timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
-    log_messages.append(f"[{timestamp}] {message}")
-    if len(log_messages) > MAX_LOGS:
-        log_messages.pop(0)
 
 # ---------- FULL COUNTRY MAP (complete) ----------
 COUNTRY_MAP = {
@@ -363,7 +355,7 @@ def extract_otp(text):
                 return m.group(1)
     return None
 
-# ---------- SESSION MANAGEMENT ----------
+# ---------- SESSION MANAGEMENT (EXACTLY LIKE NODE.JS) ----------
 def create_session_with_retries():
     sess = requests.Session()
     retry = Retry(total=3, backoff_factor=1, status_forcelist=[429, 500, 502, 503, 504])
@@ -373,13 +365,12 @@ def create_session_with_retries():
     return sess
 
 def login():
-    global session, last_login
+    global session, sesskey, last_login
     with login_lock:
         if session and (time.time() - last_login) < 3600:
-            add_log("Login skipped – session still valid")
             return True
-        add_log("Starting login...")
         try:
+            print("[LOGIN] Starting...")
             session = create_session_with_retries()
             login_paths = ["/login", "/sign-in"]
             success = False
@@ -389,25 +380,22 @@ def login():
                     login_url = f"{BASE_URL}{login_path}"
                     r1 = session.get(login_url, headers=HEADERS, timeout=10)
                     if r1.status_code in (503, 403):
-                        add_log(f"Login page {login_path} returned {r1.status_code}, waiting 3s")
+                        print(f"[LOGIN] {r1.status_code} on login page, waiting 3s...")
                         time.sleep(3)
                         continue
                     if r1.status_code != 200:
-                        add_log(f"Login page {login_path} returned {r1.status_code}, skipping")
                         continue
 
                     html = r1.text
                     captcha_match = re.search(r'What is (\d+) \+ (\d+) = \?', html)
                     if not captcha_match:
-                        add_log(f"No captcha found on {login_path}, skipping")
                         continue
                     ans = int(captcha_match[1]) + int(captcha_match[2])
-                    add_log(f"Captcha answer: {ans}")
+                    print(f"[LOGIN] Captcha answer: {ans}")
 
                     signin_url = f"{BASE_URL}/signin"
                     data = {"username": USERNAME, "password": PASSWORD, "capt": str(ans)}
                     headers_post = {**HEADERS, "Content-Type": "application/x-www-form-urlencoded"}
-                    headers_post["Referer"] = login_url
 
                     r2 = session.post(
                         signin_url,
@@ -416,141 +404,140 @@ def login():
                         allow_redirects=False,
                         timeout=10
                     )
-                    add_log(f"POST /signin status: {r2.status_code}")
+                    print(f"[LOGIN] POST status: {r2.status_code}")
 
                     if r2.status_code in (503, 403):
-                        add_log(f"Signin {r2.status_code}, waiting 3s")
+                        print(f"[LOGIN] {r2.status_code} on signin, waiting 3s...")
                         time.sleep(3)
                         continue
 
                     if r2.status_code in (302, 301):
                         last_login = time.time()
-                        add_log(f"Login successful ({r2.status_code})")
+                        print(f"[LOGIN] Success ({r2.status_code})")
                         success = True
                         break
                     elif r2.status_code == 200:
                         html2 = r2.text.lower()
                         if "logout" in html2 or "dashboard" in html2:
                             last_login = time.time()
-                            add_log("Login successful (200 with logout/dashboard)")
+                            print("[LOGIN] Success (200)")
                             success = True
                             break
                 except Exception as e:
-                    add_log(f"Error with {login_path}: {e}")
-                    continue
+                    print(f"[LOGIN] Error with {login_path}: {e}")
 
             if not success:
-                add_log("All login paths failed")
-                session = None
-                return False
+                raise Exception("All login paths failed")
 
-            add_log("Login complete (session assumed valid)")
+            time.sleep(0.5)
+            # Fetch sesskey from agent stats
+            r3 = session.get(
+                f"{BASE_URL}/agent/SMSCDRStats",
+                headers={**HEADERS, "Referer": f"{BASE_URL}/agent/SMSCDRStats"},
+                timeout=10
+            )
+            if r3.status_code == 200:
+                patterns = [
+                    r'data_smscdr\.php[^"]*sesskey=([^&"\s]+)',
+                    r'sesskey=([^&\s"\']+)',
+                    r'var\s+sesskey\s*=\s*["\']([^"\']+)["\'];',
+                    r'SESSKEY\s*[:=]\s*["\']?([a-zA-Z0-9+/=]+)["\']?'
+                ]
+                for pat in patterns:
+                    m = re.search(pat, r3.text)
+                    if m:
+                        sesskey = m.group(1)
+                        print(f"[SESSKEY] Found: {sesskey}")
+                        break
+
+            # NO VALIDATION – login redirect is enough
             return True
         except Exception as e:
-            add_log(f"Login failed: {e}")
+            print(f"[LOGIN] Failed: {e}")
             session = None
+            sesskey = None
             return False
 
 def ensure_session():
-    global session, last_login
     if not session or (time.time() - last_login) > 3600:
-        add_log("Session expired or missing – re-logging...")
+        print("[SESSION] Expired, re-logging...")
         return login()
+    if sesskey is None:
+        # try to refresh sesskey without full login
+        try:
+            r = session.get(
+                f"{BASE_URL}/agent/SMSCDRStats",
+                headers={**HEADERS, "Referer": f"{BASE_URL}/agent/SMSCDRStats"},
+                timeout=10
+            )
+            if r.status_code == 200:
+                patterns = [
+                    r'data_smscdr\.php[^"]*sesskey=([^&"\s]+)',
+                    r'sesskey=([^&\s"\']+)',
+                    r'var\s+sesskey\s*=\s*["\']([^"\']+)["\'];',
+                    r'SESSKEY\s*[:=]\s*["\']?([a-zA-Z0-9+/=]+)["\']?'
+                ]
+                for pat in patterns:
+                    m = re.search(pat, r.text)
+                    if m:
+                        sesskey = m.group(1)
+                        print(f"[SESSKEY] Refreshed: {sesskey}")
+                        break
+        except:
+            pass
+        if sesskey is None:
+            # if still missing, re-login
+            return login()
     return True
 
-# ---------- FETCH WITH RETRY & CIRCUIT BREAKER ----------
-def fetch_with_retry(url, method='GET', headers=None, params=None, data=None, retries=3):
-    attempt = 0
-    delay = 2
-    while attempt < retries:
-        try:
-            if method.upper() == 'GET':
-                resp = requests.get(url, headers=headers, params=params, timeout=20)
-            else:
-                resp = requests.post(url, headers=headers, params=params, data=data, timeout=20)
-            if resp.status_code in (503, 429, 403):
-                retry_after = int(resp.headers.get('retry-after', 0))
-                wait = retry_after if 0 < retry_after <= 10 else delay
-                add_log(f"Fetch {resp.status_code}, attempt {attempt+1}, waiting {wait}s")
-                time.sleep(wait)
-                delay = min(delay * 2, 10)
-                attempt += 1
-                continue
-            return resp
-        except Exception as e:
-            add_log(f"Fetch error: {e}")
-            attempt += 1
-            if attempt < retries:
-                time.sleep(delay)
-                delay = min(delay * 2, 10)
-    add_log(f"Max retries exceeded for {url}")
-    return None
-
-def fetch_with_circuit_breaker(url, method='GET', headers=None, params=None, data=None):
-    global consecutive_failures
-    if consecutive_failures >= FAILURE_THRESHOLD:
-        add_log(f"Circuit breaker active – skipping fetch for {BREAKER_TIMEOUT}s")
-        time.sleep(BREAKER_TIMEOUT)
-        consecutive_failures = 0
-    resp = fetch_with_retry(url, method, headers, params, data)
-    if resp is None:
-        consecutive_failures += 1
-        return None
-    else:
-        consecutive_failures = 0
-        return resp
-
-# ---------- FETCH NUMBERS (CLIENT) ----------
+# ---------- FETCH NUMBERS (old agent endpoint) ----------
 def fetch_numbers():
     if not ensure_session():
-        add_log("ensure_session failed in fetch_numbers")
         return []
-    ts = int(time.time() * 1000)
-    url = f"{BASE_URL}/client/MySMSNumbers"
     params = {
         "frange": "", "fclient": "", "fnumber": "",
         "sEcho": "1", "iDisplayStart": "0", "iDisplayLength": "-1",
-        "_": ts
+        "_": int(time.time() * 1000)
     }
-    headers = {
-        **HEADERS,
-        "Referer": f"{BASE_URL}/client/MySMSNumbers"
-    }
-    resp = fetch_with_circuit_breaker(url, 'GET', headers, params)
-    if not resp or resp.status_code != 200:
-        add_log(f"Numbers fetch failed: {resp.status_code if resp else 'no response'}")
-        raise Exception(f"Numbers fetch failed")
-    data = resp.json()
-    if not data.get('aaData'):
-        add_log("Numbers response has no aaData")
+    if sesskey:
+        params["sesskey"] = sesskey
+    try:
+        resp = session.get(
+            f"{BASE_URL}/agent/res/data_smsnumbers.php",
+            headers={**HEADERS, "Referer": f"{BASE_URL}/agent/MySMSNumbers2"},
+            params=params,
+            timeout=15
+        )
+        if resp.status_code != 200:
+            return []
+        data = resp.json()
+        result = []
+        for row in data.get("aaData", []):
+            if len(row) < 4:
+                continue
+            raw = row[3].strip()
+            if not raw:
+                continue
+            cleaned = clean_number(raw)
+            if cleaned:
+                result.append({
+                    "raw": raw,
+                    "e164": cleaned['phone'],
+                    "country": cleaned['country'],
+                    "flag": cleaned['flag']
+                })
+            else:
+                result.append({"raw": raw, "e164": None, "country": "Unknown", "flag": "🌍"})
+        return result
+    except Exception as e:
+        print(f"[NUMBERS] Error: {e}")
         return []
-    result = []
-    for row in data['aaData']:
-        if len(row) < 4:
-            continue
-        raw = row[3].strip() if row[3] else ''
-        if not raw:
-            continue
-        cleaned = clean_number(raw)
-        if cleaned:
-            result.append({
-                "raw": raw,
-                "e164": cleaned['phone'],
-                "country": cleaned['country'],
-                "flag": cleaned['flag']
-            })
-        else:
-            result.append({"raw": raw, "e164": None, "country": "Unknown", "flag": "🌍"})
-    add_log(f"Fetched {len(result)} numbers")
-    return result
 
-# ---------- FETCH OTPs (CLIENT) ----------
-def fetch_otps(limit=10):
+# ---------- FETCH OTPs (old agent endpoint) ----------
+def fetch_otps(limit=100):
     if not ensure_session():
-        add_log("ensure_session failed in fetch_otps")
         return []
     today = time.strftime("%Y-%m-%d")
-    url = f"{BASE_URL}/client/SMSCDRStats"
     params = {
         "fdate1": f"{today} 00:00:00",
         "fdate2": f"{today} 23:59:59",
@@ -560,52 +547,68 @@ def fetch_otps(limit=10):
         "fg": "0",
         "sEcho": "1",
         "iDisplayStart": "0",
-        "iDisplayLength": "100",
+        "iDisplayLength": str(limit),
         "_": int(time.time() * 1000)
     }
-    headers = {
-        **HEADERS,
-        "Referer": f"{BASE_URL}/client/SMSCDRStats"
-    }
-    resp = fetch_with_circuit_breaker(url, 'GET', headers, params)
-    if not resp or resp.status_code != 200:
-        add_log(f"OTP fetch failed: {resp.status_code if resp else 'no response'}")
+    if sesskey:
+        params["sesskey"] = sesskey
+
+    try:
+        resp = session.get(
+            f"{BASE_URL}/agent/res/data_smscdr.php",
+            headers={**HEADERS, "Referer": f"{BASE_URL}/agent/SMSCDRStats"},
+            params=params,
+            timeout=20
+        )
+        if resp.status_code != 200:
+            print(f"[OTP] Fetch failed: {resp.status_code}")
+            return []
+
+        data = resp.json()
+        if not data.get("aaData"):
+            print("[OTP] Empty aaData")
+            return []
+
+        rows = data["aaData"]
+        rows.sort(key=lambda x: x[0] if x and len(x) > 0 else '', reverse=True)
+
+        result = []
+        for row in rows:
+            if len(row) < 6:
+                continue
+            number = row[2].strip() if row[2] else ''
+            message = row[5].strip() if row[5] else ''
+            if not number or not message:
+                continue
+
+            otp = extract_otp(message)
+            if not otp:
+                continue
+
+            service = row[3].strip() if len(row) > 3 and row[3] else 'Unknown'
+            timestamp = row[0] if row[0] else ''
+            cleaned = clean_number(number)
+            country = cleaned['country'] if cleaned else 'Unknown'
+            flag = cleaned['flag'] if cleaned else '🌍'
+
+            result.append({
+                "number": number,
+                "otp": otp,
+                "service": service,
+                "message": message[:300],
+                "timestamp": timestamp,
+                "country": country,
+                "flag": flag
+            })
+
+            if len(result) >= 10:   # return last 10
+                break
+
+        print(f"[OTP] Found {len(result)} OTPs")
+        return result
+    except Exception as e:
+        print(f"[OTP] Error: {e}")
         return []
-    data = resp.json()
-    if not data.get('aaData'):
-        add_log("OTP response has no aaData")
-        return []
-    rows = data['aaData']
-    rows.sort(key=lambda x: x[0] if x and len(x) > 0 else '', reverse=True)
-    result = []
-    for row in rows:
-        if len(row) < 6:
-            continue
-        number = row[2].strip() if row[2] else ''
-        message = row[5].strip() if row[5] else ''
-        if not number or not message:
-            continue
-        otp = extract_otp(message)
-        if not otp:
-            continue
-        service = row[3].strip() if len(row) > 3 and row[3] else 'Unknown'
-        timestamp = row[0] if row[0] else ''
-        cleaned = clean_number(number)
-        country = cleaned['country'] if cleaned else 'Unknown'
-        flag = cleaned['flag'] if cleaned else '🌍'
-        result.append({
-            "number": number,
-            "otp": otp,
-            "service": service,
-            "message": message[:300],
-            "timestamp": timestamp,
-            "country": country,
-            "flag": flag
-        })
-        if len(result) >= limit:
-            break
-    add_log(f"Fetched {len(result)} OTPs")
-    return result
 
 # ---------- CACHED OTPs ----------
 def get_cached_otps():
@@ -613,102 +616,19 @@ def get_cached_otps():
         now = time.time()
         if otp_cache["data"] and (now - otp_cache["timestamp"]) < 10:
             return otp_cache["data"]
-        fresh = fetch_otps(10)
+        fresh = fetch_otps(100)
         if fresh:
             otp_cache["data"] = fresh
             otp_cache["timestamp"] = now
             return fresh
         return otp_cache["data"]
 
-# ---------- DEBUG ROUTE ----------
-@app.route("/debug")
-def debug():
-    """Test both client and agent endpoints and show raw responses."""
-    if not ensure_session():
-        return jsonify({"error": "Not logged in"}), 500
-
-    results = {}
-
-    # Test client numbers
-    try:
-        url = f"{BASE_URL}/client/MySMSNumbers"
-        params = {"sEcho": "1", "iDisplayStart": "0", "iDisplayLength": "1"}
-        headers = {**HEADERS, "Referer": url}
-        resp = session.get(url, headers=headers, params=params, timeout=10)
-        results["client_numbers"] = {
-            "status": resp.status_code,
-            "content_type": resp.headers.get("content-type"),
-            "preview": resp.text[:500]
-        }
-    except Exception as e:
-        results["client_numbers"] = {"error": str(e)}
-
-    # Test client OTPs
-    try:
-        today = time.strftime("%Y-%m-%d")
-        url = f"{BASE_URL}/client/SMSCDRStats"
-        params = {
-            "fdate1": f"{today} 00:00:00",
-            "fdate2": f"{today} 23:59:59",
-            "sEcho": "1",
-            "iDisplayStart": "0",
-            "iDisplayLength": "1",
-            "_": int(time.time()*1000)
-        }
-        headers = {**HEADERS, "Referer": url}
-        resp = session.get(url, headers=headers, params=params, timeout=10)
-        results["client_otps"] = {
-            "status": resp.status_code,
-            "content_type": resp.headers.get("content-type"),
-            "preview": resp.text[:500]
-        }
-    except Exception as e:
-        results["client_otps"] = {"error": str(e)}
-
-    # Test agent numbers (to see if it returns HTML)
-    try:
-        url = f"{BASE_URL}/agent/res/data_smsnumbers.php"
-        params = {"sEcho": "1", "iDisplayStart": "0", "iDisplayLength": "1"}
-        headers = {**HEADERS, "Referer": f"{BASE_URL}/agent/MySMSNumbers2"}
-        resp = session.get(url, headers=headers, params=params, timeout=10)
-        results["agent_numbers"] = {
-            "status": resp.status_code,
-            "content_type": resp.headers.get("content-type"),
-            "preview": resp.text[:500]
-        }
-    except Exception as e:
-        results["agent_numbers"] = {"error": str(e)}
-
-    # Test agent OTPs
-    try:
-        today = time.strftime("%Y-%m-%d")
-        url = f"{BASE_URL}/agent/res/data_smscdr.php"
-        params = {
-            "fdate1": f"{today} 00:00:00",
-            "fdate2": f"{today} 23:59:59",
-            "sEcho": "1",
-            "iDisplayStart": "0",
-            "iDisplayLength": "1",
-            "_": int(time.time()*1000)
-        }
-        headers = {**HEADERS, "Referer": f"{BASE_URL}/agent/SMSCDRStats"}
-        resp = session.get(url, headers=headers, params=params, timeout=10)
-        results["agent_otps"] = {
-            "status": resp.status_code,
-            "content_type": resp.headers.get("content-type"),
-            "preview": resp.text[:500]
-        }
-    except Exception as e:
-        results["agent_otps"] = {"error": str(e)}
-
-    return jsonify(results)
-
 # ---------- ROUTES ----------
 @app.route("/")
 def root():
     return jsonify({
-        "message": "NumberPanel API (Client – no validation, no sesskey)",
-        "endpoints": ["/numbers", "/sms", "/logs", "/debug"],
+        "message": "NumberPanel API (Agent endpoints, no validation)",
+        "endpoints": ["/numbers", "/sms"],
         "status": "online"
     })
 
@@ -718,7 +638,6 @@ def numbers():
         data = fetch_numbers()
         return jsonify({"success": True, "count": len(data), "numbers": data})
     except Exception as e:
-        add_log(f"/numbers error: {e}")
         return jsonify({"success": False, "error": str(e)}), 500
 
 @app.route("/sms")
@@ -727,15 +646,7 @@ def sms():
         data = get_cached_otps()
         return jsonify({"success": True, "count": len(data), "otps": data})
     except Exception as e:
-        add_log(f"/sms error: {e}")
         return jsonify({"success": False, "error": str(e)}), 500
-
-@app.route("/logs")
-def logs():
-    return jsonify({
-        "logs": log_messages,
-        "count": len(log_messages)
-    })
 
 if __name__ == "__main__":
     app.run(debug=True, port=8000)
